@@ -3,17 +3,19 @@ package net.simplifiedcoding.mlkitsample.qrscanner
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Bundle
 import android.os.Handler
-import android.os.Looper
+import android.os.Looper // Pastikan import ini ada
 import android.util.Log
 import android.util.Size
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
@@ -32,74 +34,78 @@ class ScannerActivity : AppCompatActivity() {
     private lateinit var processCameraProvider: ProcessCameraProvider
     private lateinit var cameraPreview: Preview
     private lateinit var imageAnalysis: ImageAnalysis
-    private lateinit var qrOverlayView: QrOverlayView // Added
+    private lateinit var qrOverlayView: QrOverlayView
 
-    private val cameraXViewModel by viewModels<CameraXViewModel>() // Corrected delegate usage
+    private val cameraXViewModel: CameraXViewModel by viewModels()
 
-    private val mainHandler = Handler(Looper.getMainLooper()) // For UI updates
-    private var lastScanTime = 0L
-    private val scanClearDelay = 2000L // Clear overlay after 2s of no scans
-
+    // --- Bagian untuk Fitur Reset Overlay ---
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var lastQrCodeDetectedTime: Long = 0L
+    private val overlayClearDelayMillis: Long = 2000L // Overlay akan hilang setelah 2 detik tidak ada QR terdeteksi
+    private lateinit var overlayCleanupRunnable: Runnable
+    // --- Akhir Bagian Fitur Reset Overlay ---
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityScannerBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        qrOverlayView = binding.qrOverlayView // Initialize overlay view
+        qrOverlayView = binding.qrOverlayView
 
         cameraSelector =
             CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
 
-        cameraXViewModel.processCameraProvider.observe(this) { provider -> // Corrected viewModel access
+        cameraXViewModel.processCameraProvider.observe(this) { provider ->
             processCameraProvider = provider
-            bindCameraPreview()
-            bindInputAnalyser()
+            bindCameraUsesCases()
         }
 
-        // Start a task to clear the overlay if no QR codes are detected for a while
-        startOverlayCleanupTask()
+        // --- Mulai Tugas Pembersihan Overlay ---
+        initializeOverlayCleanupTask()
+        // --- Akhir Mulai Tugas Pembersihan Overlay ---
+    }
+
+    private fun bindCameraUsesCases() {
+        binding.previewView.post {
+            bindCameraPreview()
+            bindInputAnalyser()
+            try {
+                processCameraProvider.unbindAll()
+                processCameraProvider.bindToLifecycle(
+                    this,
+                    cameraSelector,
+                    cameraPreview,
+                    imageAnalysis
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Use case binding failed", e)
+            }
+        }
     }
 
     private fun bindCameraPreview() {
+        // ... (implementasi bindCameraPreview Anda)
         cameraPreview = Preview.Builder()
             .setTargetRotation(binding.previewView.display.rotation)
             .build()
         cameraPreview.setSurfaceProvider(binding.previewView.surfaceProvider)
-        try {
-            processCameraProvider.unbindAll() // Unbind use cases before rebinding
-            processCameraProvider.bindToLifecycle(this, cameraSelector, cameraPreview)
-        } catch (illegalStateException: IllegalStateException) {
-            Log.e(TAG, illegalStateException.message ?: "IllegalStateException")
-        } catch (illegalArgumentException: IllegalArgumentException) {
-            Log.e(TAG, illegalArgumentException.message ?: "IllegalArgumentException")
-        }
     }
 
     private fun bindInputAnalyser() {
+        // ... (implementasi bindInputAnalyser Anda)
         val barcodeScanner: BarcodeScanner = BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder()
-                .setBarcodeFormats(Barcode.FORMAT_QR_CODE) // Only QR codes
+                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
                 .build()
         )
         imageAnalysis = ImageAnalysis.Builder()
             .setTargetRotation(binding.previewView.display.rotation)
-            // Optimize for smoother preview, analysis might be slightly delayed
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
 
-        val cameraExecutor = Executors.newSingleThreadExecutor()
+        val cameraExecutor = Executors.newSingleThreadExecutor() // Sebaiknya didefinisikan sebagai member class jika akan di-shutdown
 
         imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
             processImageProxy(barcodeScanner, imageProxy)
-        }
-
-        try {
-            // Important: Bind imageAnalysis as well
-            processCameraProvider.bindToLifecycle(this, cameraSelector, cameraPreview, imageAnalysis)
-        } catch (illegalStateException: IllegalStateException) {
-            Log.e(TAG, illegalStateException.message ?: "IllegalStateException")
-        } catch (illegalArgumentException: IllegalArgumentException) {
-            Log.e(TAG, illegalArgumentException.message ?: "IllegalArgumentException")
         }
     }
 
@@ -108,106 +114,108 @@ class ScannerActivity : AppCompatActivity() {
         barcodeScanner: BarcodeScanner,
         imageProxy: ImageProxy
     ) {
-        val mediaImage = imageProxy.image ?: run {
-            imageProxy.close()
-            return
-        }
+        val mediaImage = imageProxy.image
+        if (mediaImage != null) {
+            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+            barcodeScanner.process(image)
+                .addOnSuccessListener { barcodes ->
+                    val scannedQrResults = mutableListOf<QrScanResult>()
+                    if (barcodes.isNotEmpty()) {
+                        // --- Catat Waktu Deteksi Terakhir ---
+                        lastQrCodeDetectedTime = System.currentTimeMillis()
+                        // --- Akhir Catat Waktu Deteksi Terakhir ---
 
-        val inputImage =
-            InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-
-        barcodeScanner.process(inputImage)
-            .addOnSuccessListener { barcodes ->
-                lastScanTime = System.currentTimeMillis() // Update last scan time
-                val scannedQrResults = mutableListOf<QrScanResult>()
-
-                if (barcodes.isNotEmpty()) {
-                    for (barcode in barcodes) {
-                        barcode.boundingBox?.let { boundingBox ->
-                            val transformedBoundingBox = transformBoundingBox(
-                                boundingBox,
-                                // Pass imageProxy dimensions for correct scaling
-                                Size(imageProxy.width, imageProxy.height),
-                                binding.previewView
-                            )
-                            val (typeText, contentText) = getBarcodeDisplayText(barcode)
-                            scannedQrResults.add(
-                                QrScanResult(
-                                    transformedBoundingBox,
-                                    contentText,
-                                    typeText
+                        for (barcode in barcodes) {
+                            barcode.boundingBox?.let { boundingBox ->
+                                val transformedBoundingBox = 坐标转换( // Pastikan fungsi ini sudah ada
+                                    boundingBox,
+                                    Size(imageProxy.width, imageProxy.height),
+                                    binding.previewView,
+                                    imageProxy.imageInfo.rotationDegrees
                                 )
-                            )
+                                val (typeText, contentText) = getBarcodeDisplayText(barcode)
+                                scannedQrResults.add(
+                                    QrScanResult(
+                                        transformedBoundingBox,
+                                        contentText,
+                                        typeText
+                                    )
+                                )
+                            }
                         }
+                        mainHandler.post { qrOverlayView.updateScans(scannedQrResults) }
+                    } else {
+                        // Tidak ada barcode terdeteksi di frame ini.
+                        // Jangan update lastQrCodeDetectedTime.
+                        // Mekanisme timeout akan membersihkan overlay jika ini berlanjut.
+                        // Jika Anda ingin overlay langsung hilang saat tidak ada QR di frame:
+                        // mainHandler.post { qrOverlayView.clearScans() }
+                        // Tapi ini bisa menyebabkan kedipan jika deteksi sesaat hilang.
                     }
-                    mainHandler.post { qrOverlayView.updateScans(scannedQrResults) }
-
-                    // You can still update the TextViews if you want, for debugging
-                    // showBarcodeInfo(barcodes.first())
-                } else {
-                    // No barcodes detected in this frame, but don't clear immediately
-                    // The cleanup task will handle it.
                 }
-            }
-            .addOnFailureListener {
-                Log.e(TAG, it.message ?: it.toString())
-            }.addOnCompleteListener {
-                imageProxy.close()
-            }
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "Barcode scanning failed: ${e.message}", e)
+                }
+                .addOnCompleteListener {
+                    imageProxy.close()
+                }
+        } else {
+            imageProxy.close()
+        }
     }
 
-    private fun transformBoundingBox(
+    // --- Fungsi untuk Fitur Reset Overlay ---
+    private fun initializeOverlayCleanupTask() {
+        overlayCleanupRunnable = object : Runnable {
+            override fun run() {
+                if (System.currentTimeMillis() - lastQrCodeDetectedTime > overlayClearDelayMillis) {
+                    // Pastikan qrOverlayView sudah diinisialisasi sebelum memanggil metodenya
+                    if (::qrOverlayView.isInitialized) {
+                        qrOverlayView.clearScans()
+                    }
+                }
+                // Jadwalkan pengecekan berikutnya
+                mainHandler.postDelayed(this, overlayClearDelayMillis / 2) // Periksa setiap setengah dari delay
+            }
+        }
+        // Mulai pengecekan periodik
+        mainHandler.postDelayed(overlayCleanupRunnable, overlayClearDelayMillis / 2)
+    }
+    // --- Akhir Fungsi untuk Fitur Reset Overlay ---
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // --- Hentikan Tugas Pembersihan Overlay ---
+        mainHandler.removeCallbacks(overlayCleanupRunnable)
+        // --- Akhir Hentikan Tugas Pembersihan Overlay ---
+        // Jika cameraExecutor adalah member class, matikan di sini:
+        // cameraExecutor.shutdown()
+    }
+
+    // Fungsi 坐标转换 dan getBarcodeDisplayText Anda
+    private fun 坐标转换(
         originalBox: Rect,
-        imageSize: Size, // Actual size of the image being processed
-        previewView: androidx.camera.view.PreviewView
+        imageSize: Size,
+        previewView: PreviewView,
+        imageRotationDegrees: Int
     ): RectF {
+        val matrix = Matrix()
         val previewWidth = previewView.width.toFloat()
         val previewHeight = previewView.height.toFloat()
-
-        // Determine the scale factors
-        // This depends on PreviewView.ScaleType. Usually FIT_CENTER or FILL_CENTER
-        // For simplicity, assuming FIT_CENTER behavior for scaling.
-        // A more robust solution would consider the actual scale type and image rotation relative to display.
-
-        val imageWidth = imageSize.width.toFloat()
-        val imageHeight = imageSize.height.toFloat()
-
-        // Adjust for rotation. If image rotation is 90 or 270, swap width and height for scaling.
-        val (rotatedImageWidth, rotatedImageHeight) = if (previewView.display.rotation % 180 != 0) {
-            Pair(imageHeight, imageWidth) // If display is landscape, and image is portrait (or vice-versa)
+        val (imgWidth, imgHeight) = if (imageRotationDegrees == 90 || imageRotationDegrees == 270) {
+            Pair(imageSize.height.toFloat(), imageSize.width.toFloat())
         } else {
-            Pair(imageWidth, imageHeight)
+            Pair(imageSize.width.toFloat(), imageSize.height.toFloat())
         }
-
-
-        val scaleX = previewWidth / rotatedImageWidth
-        val scaleY = previewHeight / rotatedImageHeight
-
-        // Choose the smaller scale factor to ensure the image fits (FIT_CENTER logic)
-        // If your PreviewView uses FILL_CENTER, you might need Math.max here,
-        // and then handle cropping/offsetting.
-        val scale = min(scaleX, scaleY)
-
-        // Calculate the offset to center the scaled image within the PreviewView
-        val offsetX = (previewWidth - (rotatedImageWidth * scale)) / 2f
-        val offsetY = (previewHeight - (rotatedImageHeight * scale)) / 2f
-
-        // Apply scaling and offset
-        // The bounding box from ML Kit is for the unrotated image.
-        // We need to map these coordinates correctly.
-
-        // This is a simplified transformation. A full solution would handle the PreviewView's
-        // coordinate mapping more precisely, considering `PreviewView.getOutputTransformMatrix()`.
-        // However, for many common cases, this direct scaling can work.
-
-        val newLeft = originalBox.left * scale + offsetX
-        val newTop = originalBox.top * scale + offsetY
-        val newRight = originalBox.right * scale + offsetX
-        val newBottom = originalBox.bottom * scale + offsetY
-
-        return RectF(newLeft, newTop, newRight, newBottom)
+        val scaleFactor = min(previewWidth / imgWidth, previewHeight / imgHeight)
+        val dx = (previewWidth - (imgWidth * scaleFactor)) / 2f
+        val dy = (previewHeight - (imgHeight * scaleFactor)) / 2f
+        matrix.postScale(scaleFactor, scaleFactor)
+        matrix.postTranslate(dx, dy)
+        val transformedRect = RectF(originalBox)
+        matrix.mapRect(transformedRect)
+        return transformedRect
     }
-
 
     private fun getBarcodeDisplayText(barcode: Barcode): Pair<String, String> {
         val typeText = when (barcode.valueType) {
@@ -227,36 +235,8 @@ class ScannerActivity : AppCompatActivity() {
         return Pair(typeText, contentText)
     }
 
-    // Kept for compatibility if you still want to update TextViews
-    private fun showBarcodeInfo(barcode: Barcode) {
-        val (typeText, contentText) = getBarcodeDisplayText(barcode)
-        binding.textViewQrType.text = typeText
-        binding.textViewQrContent.text = contentText
-    }
-
-
-    private fun startOverlayCleanupTask() {
-        mainHandler.post(object : Runnable {
-            override fun run() {
-                if (System.currentTimeMillis() - lastScanTime > scanClearDelay) {
-                    qrOverlayView.clearScans()
-                }
-                mainHandler.postDelayed(this, scanClearDelay / 2) // Check periodically
-            }
-        })
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        mainHandler.removeCallbacksAndMessages(null) // Clean up handler
-        // CameraX resources are lifecycle-aware, usually no need for manual shutdown here
-        // if ProcessCameraProvider is correctly bound to the lifecycle.
-    }
-
-
     companion object {
-        private val TAG = ScannerActivity::class.simpleName // Corrected to be val
-
+        private val TAG = ScannerActivity::class.java.simpleName
         fun startScanner(context: Context) {
             Intent(context, ScannerActivity::class.java).also {
                 context.startActivity(it)
